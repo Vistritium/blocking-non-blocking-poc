@@ -31,31 +31,45 @@ object Main extends LazyLogging {
     implicit val system = ActorSystem("my-system")
     implicit val materializer = ActorMaterializer()
     implicit val executionContext = system.dispatcher
+    var i = 0
 
     val route =
       path("client") {
         get {
           val promise = Promise[String]()
           val uuid = UUID.randomUUID().toString.substring(0, 8)
-          logger.info(s"reqReceived: ${reqReceived.incrementAndGet()} uuid: $uuid")
+          val reqReceivedCount = reqReceived.incrementAndGet()
+          logger.trace(s"reqReceived: ${reqReceivedCount} uuid: $uuid")
           logger.trace(s"Request start: $uuid")
           val httpGet = new HttpGet(target)
           val futureCallback = new FutureCallback[http.HttpResponse] {
-            override def failed(ex: Exception): Unit = promise.failure(ex)
+            override def failed(ex: Exception): Unit = {
+              val reqCompletedCounter = reqFutureCompleted.incrementAndGet()
+              logger.trace(s"reqFutureCompleted error: $reqCompletedCounter", ex)
+              promise.failure(ex)
+            }
 
             override def completed(result: http.HttpResponse): Unit = {
-              promise.success(IOUtils.toString(result.getEntity.getContent))
+              promise.success("success")
               EntityUtils.consume(result.getEntity)
-              logger.trace(s"reqFutureCompleted: ${reqFutureCompleted.incrementAndGet()}")
+              val reqCompletedCounter = reqFutureCompleted.incrementAndGet()
+              logger.trace(s"reqFutureCompleted: $reqCompletedCounter")
             }
 
             override def cancelled(): Unit = promise.failure(new RuntimeException("Cancelled"))
           }
 
           Config.asyncClient.execute(httpGet, futureCallback)
-          logger.trace(s"reqFutureWaiting: ${reqFutureWaiting.incrementAndGet()}")
+          val reqWaitCounter = reqFutureWaiting.incrementAndGet()
+
+          if (i % 1000 == 0) {
+            logger.debug(s"reqFutureWaiting: ${reqWaitCounter - reqFutureCompleted.get()}")
+          }
+          i = i + 1
+
           onComplete(promise.future) {
             case Failure(exception) => {
+              logger.error("Failure", exception)
               complete(HttpResponse(StatusCodes.InternalServerError, entity = exception.getMessage))
             }
             case Success(value) => {
@@ -64,11 +78,17 @@ object Main extends LazyLogging {
             }
           }
         }
+      } ~ path("count") {
+        get {
+          val futureCompletedCount = reqFutureCompleted.get()
+          val waitingCount = reqFutureWaiting.get()
+          complete(s"reqFutureWaiting: $waitingCount\nreqFutureReceived: ${reqReceived.get()}\nreqFutureCompleted: $futureCompletedCount\n\nWaiting: ${waitingCount - futureCompletedCount}")
+        }
       }
 
-    val bindingFuture = Http().bindAndHandle(route, "localhost", 8080)
+    val bindingFuture = Http().bindAndHandle(route, "localhost", 8000)
 
-    logger.info(s"Server online at http://localhost:8080/\nPress RETURN to stop...")
+    logger.info(s"Server online at http://localhost:8000/\nPress RETURN to stop...")
     StdIn.readLine()
     bindingFuture
       .flatMap(_.unbind())
